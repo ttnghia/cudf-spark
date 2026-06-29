@@ -416,7 +416,7 @@ class SpillableHostBufferHandle private (
     synchronized {
       if (closed) {
         throw new IllegalStateException(
-          "attempting to materialize a closed handle")
+          SpillFramework.closedHandleMaterializeMessage)
       // after spilling, the host can get removed asynchronously, so let's
       // use disk if it's defined even if host is still present
       } else if (disk.isDefined) {
@@ -592,7 +592,7 @@ class SpillableDeviceBufferHandle private (
     synchronized {
       if (closed) {
         throw new IllegalStateException(
-          "attempting to materialize a closed handle")
+          SpillFramework.closedHandleMaterializeMessage)
       } else if (host.isDefined) {
         // since we spilled, host must be set.
         hostHandle = host.get
@@ -703,7 +703,7 @@ class SpillableColumnarBatchHandle private (
     synchronized {
       if (closed) {
         throw new IllegalStateException(
-          "attempting to materialize a closed handle")
+          SpillFramework.closedHandleMaterializeMessage)
       } else if (host.isDefined) {
         hostHandle = host.get
       } else if (dev.isDefined) {
@@ -856,7 +856,7 @@ class SpillableColumnarBatchFromBufferHandle private (
     synchronized {
       if (closed) {
         throw new IllegalStateException(
-          "attempting to materialize a closed handle")
+          SpillFramework.closedHandleMaterializeMessage)
       } else if (host.isDefined) {
         hostHandle = host.get
       } else if (dev.isDefined) {
@@ -976,7 +976,7 @@ class SpillableCompressedColumnarBatchHandle private (
     synchronized {
       if (closed) {
         throw new IllegalStateException(
-          "attempting to materialize a closed handle")
+          SpillFramework.closedHandleMaterializeMessage)
       } else if (host.isDefined) {
         hostHandle = host.get
       } else if (dev.isDefined) {
@@ -1092,7 +1092,7 @@ class SpillableHostColumnarBatchHandle private (
     synchronized {
       if (closed) {
         throw new IllegalStateException(
-          "attempting to materialize a closed handle")
+          SpillFramework.closedHandleMaterializeMessage)
       // after spilling, the host can get removed asynchronously, so let's
       // use disk if it's defined even if host is still present
       } else if (disk.isDefined) {
@@ -1945,7 +1945,7 @@ class SpillableTableHandle private (
     var hostHandle: SpillableHostBufferHandle = null
     synchronized {
       if (closed) {
-        throw new IllegalStateException("attempting to materialize a closed handle")
+        throw new IllegalStateException(SpillFramework.closedHandleMaterializeMessage)
       } else if (host.isDefined) {
         hostHandle = host.get
       } else if (dev.isDefined) {
@@ -2055,6 +2055,25 @@ object SpillFramework extends Logging {
   // because they need fine control over allocations.
   var storesInternal: SpillableStores = _
 
+  // Signals that the framework is tearing down (executor shutdown). `shutdown` closes every
+  // registered handle, so an in-flight task materializing a handle races the teardown and finds
+  // it closed. We surface that race as a clear shutdown error rather than the generic closed-handle
+  // message. Volatile because it is set on the shutting-down thread and read by task threads.
+  @volatile private[spill] var shuttingDown: Boolean = false
+
+  /**
+   * Message for a materialize-after-close, disambiguating an executor-teardown race from a real
+   * logic bug so callers (and their `catch IllegalStateException`) can tell the two apart.
+   */
+  private[spill] def closedHandleMaterializeMessage: String = {
+    if (shuttingDown) {
+      "cannot materialize a spillable handle: the spill framework is shutting down " +
+        "(executor teardown)"
+    } else {
+      "attempting to materialize a closed handle"
+    }
+  }
+
   def stores: SpillableStores = {
     if (storesInternal == null) {
       throw new IllegalStateException(
@@ -2078,6 +2097,9 @@ object SpillFramework extends Logging {
   def initialize(rapidsConf: RapidsConf): Unit = synchronized {
     require(storesInternal == null,
       s"cannot initialize SpillFramework multiple times.")
+
+    // Clear any teardown signal from a prior shutdown so a re-initialized framework starts clean.
+    shuttingDown = false
 
     val hostSpillStorageSize = if (rapidsConf.offHeapLimitEnabled) {
       // Disable the limit because it is handled by the RapidsHostMemoryStore
@@ -2130,6 +2152,9 @@ object SpillFramework extends Logging {
   }
 
   def shutdown(): Unit = {
+    // Set first so the whole teardown window (closing pools and stores below, which closes every
+    // registered handle) is covered: a task racing this shutdown reads it as teardown, not a bug.
+    shuttingDown = true
     if (hostSpillBounceBufferPool != null) {
       hostSpillBounceBufferPool.close()
       hostSpillBounceBufferPool = null

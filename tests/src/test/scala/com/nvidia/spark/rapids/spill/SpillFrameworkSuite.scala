@@ -16,11 +16,14 @@
 
 package com.nvidia.spark.rapids.spill
 
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, DataOutputStream}
+
 import scala.collection.mutable.ArrayBuffer
 
 import ai.rapids.cudf._
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
+import com.nvidia.spark.rapids.jni.kudo.KudoTableHeader
 import org.scalatest.BeforeAndAfterAll
 
 import org.apache.spark.SparkConf
@@ -922,6 +925,78 @@ class SpillFrameworkSuite extends SpillUnitTestBase with BeforeAndAfterAll {
       val ct = buildCompressedBatch(0, 1000)
       val handle = SpillableCompressedColumnarBatchHandle(ct)
       testCloseWhileSpilling(handle, SpillFramework.stores.deviceStore, sleepBeforeCloseNanos)
+    }
+  }
+
+  // Serialize a minimal zero-column Kudo header stream so a `SpillableKudoTable` can be built on
+  // the host store without any GPU/RMM: `KudoTableHeader.readFrom` is the only public constructor.
+  private def zeroColumnKudoHeader(totalDataLen: Int): KudoTableHeader = {
+    val byteOut = new ByteArrayOutputStream()
+    val dout = new DataOutputStream(byteOut)
+    dout.writeInt(0x4B554430) // "KUD0" magic
+    dout.writeInt(0)          // offset
+    dout.writeInt(0)          // numRows
+    dout.writeInt(0)          // validityBufferLen
+    dout.writeInt(0)          // offsetBufferLen
+    dout.writeInt(totalDataLen)
+    dout.writeInt(0)          // numColumns -> 0 hasValidityBuffer bytes follow
+    dout.close()
+    val din = new DataInputStream(new ByteArrayInputStream(byteOut.toByteArray))
+    KudoTableHeader.readFrom(din).get()
+  }
+
+  // Reproduces the executor-teardown race: `SpillFramework.shutdown()` closes every registered
+  // spillable handle while an in-flight task still re-materializes one through
+  // `SpillableKudoTable.makeKudoTable` -> `SpillableHostBuffer.getHostBuffer` ->
+  // `SpillableHostBufferHandle.materialize`. A materialize that loses that race reports the
+  // shutdown-specific error so callers can tell teardown apart from a genuine closed-handle bug.
+  test("kudo table materialize after spill framework shutdown reports shutting down") {
+    val dataLen = 64
+    val skt = closeOnExcept(HostMemoryBuffer.allocate(dataLen)) { hmb =>
+      SpillableKudoTable(zeroColumnKudoHeader(dataLen), hmb)
+    }
+    try {
+      // Simulate executor teardown closing all registered handles on a foreign thread.
+      SpillFramework.shutdown()
+      val ex = intercept[IllegalStateException] {
+        withResource(skt.makeKudoTable) { _ => () }
+      }
+      assert(ex.getMessage.contains("shutting down"),
+        s"Expected a shutdown-specific materialize error, but got: ${ex.getMessage}")
+    } finally {
+      skt.close()
+      // Restore the singleton so later tests (and afterEach) see an initialized framework, matching
+      // the SpillUnitTestBase.beforeEach setup.
+      if (SpillFramework.storesInternal == null) {
+        val sc = new SparkConf
+        sc.set(RapidsConf.HOST_SPILL_STORAGE_SIZE.key, "1024")
+        sc.set(RapidsConf.OFF_HEAP_LIMIT_ENABLED.key, "false")
+        SpillFramework.initialize(new RapidsConf(sc))
+      }
+    }
+  }
+
+  // Counterpart to the teardown-race test above: a handle closed on its own while the framework is
+  // still up must keep reporting the generic closed-handle error, never the shutdown-specific one.
+  // This pins the non-shutdown branch of `closedHandleMaterializeMessage` so a future change cannot
+  // make every closed-handle materialize falsely look like an executor teardown.
+  test("kudo table materialize after close without shutdown reports the generic error") {
+    val dataLen = 64
+    val skt = closeOnExcept(HostMemoryBuffer.allocate(dataLen)) { hmb =>
+      SpillableKudoTable(zeroColumnKudoHeader(dataLen), hmb)
+    }
+    try {
+      // Close the handle while the framework stays initialized, so `shuttingDown` is false.
+      skt.close()
+      val ex = intercept[IllegalStateException] {
+        withResource(skt.makeKudoTable) { _ => () }
+      }
+      assert(ex.getMessage.contains("attempting to materialize a closed handle"),
+        s"Expected the generic closed-handle error, but got: ${ex.getMessage}")
+      assert(!ex.getMessage.contains("shutting down"),
+        s"A non-shutdown close must not report a teardown race, but got: ${ex.getMessage}")
+    } finally {
+      skt.close()
     }
   }
 
